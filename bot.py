@@ -7,6 +7,8 @@ import asyncio
 import subprocess
 import logging
 import sys
+import requests
+import time
 from collections import deque
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -49,7 +51,6 @@ queue = deque()
 processing = False
 current_task = None
 
-
 # ========= FLOODWAIT =========
 async def safe_api_call(func, *args, **kwargs):
     while True:
@@ -60,26 +61,18 @@ async def safe_api_call(func, *args, **kwargs):
             log("FLOODWAIT", f"Sleeping {wait_time}s")
             await asyncio.sleep(wait_time)
 
-
 # ========= METADATA =========
 def get_video_metadata(video_path):
     try:
         result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,duration",
-                "-of", "default=noprint_wrappers=1",
-                video_path
-            ],
+            ["ffprobe","-v","error","-select_streams","v:0",
+             "-show_entries","stream=width,height,duration",
+             "-of","default=noprint_wrappers=1",video_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
-
         width = height = duration = 0
-
         for line in result.stdout.splitlines():
             if line.startswith("width="):
                 width = int(line.split("=")[1])
@@ -87,27 +80,19 @@ def get_video_metadata(video_path):
                 height = int(line.split("=")[1])
             elif line.startswith("duration="):
                 duration = float(line.split("=")[1])
-
         return width, height, int(duration)
-
     except:
         return 0, 0, 0
 
-
 def random_thumbnail(video_path, thumb_path):
-    width, height, duration = get_video_metadata(video_path)
+    _, _, duration = get_video_metadata(video_path)
     timestamp = random.uniform(1, max(2, duration - 1))
-
     subprocess.run(
-        ["ffmpeg", "-ss", str(timestamp),
-         "-i", video_path,
-         "-vframes", "1",
-         "-q:v", "2",
-         thumb_path],
+        ["ffmpeg","-ss",str(timestamp),"-i",video_path,
+         "-vframes","1","-q:v","2",thumb_path],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
-
 
 # ========= QUEUE =========
 async def process_queue():
@@ -117,167 +102,210 @@ async def process_queue():
         return
 
     processing = True
-    log("QUEUE", "Processing started")
 
     while queue:
-        message = queue[0]
-        media_msg = message.reply_to_message
-        media = media_msg.document or media_msg.video or media_msg.audio or media_msg.photo
-        file_name = getattr(media, "file_name", "photo")
+        task_type, message, queue_msg, file_name = queue[0]
 
-        log("PROCESS", f"Now processing: {file_name}")
-
-        current_task = asyncio.create_task(handle_download(message))
+        log("PROCESS", f"Started: {file_name} | Type: {task_type.upper()}")
 
         try:
+            if task_type == "telegram":
+                current_task = asyncio.create_task(handle_download(message, file_name))
+            else:
+                current_task = asyncio.create_task(handle_url_download(message, file_name))
+
             await current_task
+            log("COMPLETE", f"Done: {file_name}")
+
         except asyncio.CancelledError:
-            log("CANCELLED", f"Task cancelled: {file_name}")
-            await message.reply_text("Current task cancelled.")
+            log("CANCEL", f"Cancelled: {file_name}")
+            try:
+                await message.reply_text(f"Cancelled: {file_name}")
+            except: pass
         except Exception as e:
             log("ERROR", f"{file_name} -> {str(e)}")
-            await message.reply_text("Error occurred. Check terminal logs.")
 
-        queue.popleft()
+        try:
+            await queue_msg.delete()
+        except:
+            pass
 
-    log("QUEUE", "Queue empty")
+        if queue:
+           queue.popleft()
+
     processing = False
     current_task = None
 
-
-# ========= CORE =========
-async def handle_download(message: Message):
+# ========= TELEGRAM DOWNLOAD =========
+async def handle_download(message: Message, file_name):
     replied = message.reply_to_message
     media = replied.document or replied.video or replied.audio or replied.photo
-
-    file_name = getattr(media, "file_name", None) or "file"
     file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
-    progress_msg = await message.reply_text("⬇ Downloading: 0%")
+    progress_msg = await message.reply_text("Downloading: 0%")
     last_percent = 0
+    start_time = time.time()
 
     log("DOWNLOAD", f"Starting: {file_name}")
 
-    async def download_progress(current, total):
+    async def progress(current, total):
         nonlocal last_percent
         percent = int(current * 100 / total)
         if percent - last_percent >= 5:
             last_percent = percent
-            await safe_api_call(progress_msg.edit_text, f"⬇ Downloading: {percent}%")
+            elapsed = time.time() - start_time
+            speed = current / elapsed if elapsed > 0 else 0
+            speed_mb = speed / (1024 * 1024)
+
+            await safe_api_call(
+                progress_msg.edit_text,
+                f"{file_name}\nDownloading: {percent}%\nSpeed: {speed_mb:.2f} MB/s"
+            )
 
     file_path = await safe_api_call(
         app.download_media,
         media,
         file_name=file_path,
-        progress=download_progress
+        progress=progress
     )
 
     log("DOWNLOAD", f"Completed: {file_name}")
+    await upload_file(message, file_path, file_name, progress_msg)
 
-    await safe_api_call(progress_msg.edit_text, "⬆ Uploading: 0%")
+# ========= URL DOWNLOAD =========
+async def handle_url_download(message: Message, file_name):
+    url = message.text.split(" ",1)[1].strip()
+    file_path = os.path.join(DOWNLOAD_DIR, file_name)
+
+    progress_msg = await message.reply_text("Downloading: 0%")
     last_percent = 0
-    caption = f"{file_name}"
+    start_time = time.time()
 
-    log("UPLOAD", f"Uploading: {file_name}")
+    log("DOWNLOAD", f"Starting: {file_name} (URL)")
 
-    async def upload_progress(current, total):
+    response = requests.get(url, stream=True)
+    total = int(response.headers.get("content-length", 0))
+    downloaded = 0
+
+    with open(file_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024*1024):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+
+                if total > 0:
+                    percent = int(downloaded * 100 / total)
+                    if percent - last_percent >= 5:
+                        last_percent = percent
+                        elapsed = time.time() - start_time
+                        speed = downloaded / elapsed if elapsed > 0 else 0
+                        speed_mb = speed / (1024 * 1024)
+
+                        await safe_api_call(
+                            progress_msg.edit_text,
+                            f"{file_name}\nDownloading: {percent}%\nSpeed: {speed_mb:.2f} MB/s"
+                        )
+
+    log("DOWNLOAD", f"Completed: {file_name}")
+    await upload_file(message, file_path, file_name, progress_msg)
+
+# ========= UPLOAD =========
+async def upload_file(message, file_path, file_name, progress_msg):
+
+    await safe_api_call(progress_msg.edit_text, "Uploading: 0%")
+    last_percent = 0
+    start_time = time.time()
+
+    log("UPLOAD", f"Starting: {file_name}")
+
+    async def progress(current, total):
         nonlocal last_percent
         percent = int(current * 100 / total)
         if percent - last_percent >= 5:
             last_percent = percent
-            await safe_api_call(progress_msg.edit_text, f"⬆ Uploading: {percent}%")
+            elapsed = time.time() - start_time
+            speed = current / elapsed if elapsed > 0 else 0
+            speed_mb = speed / (1024 * 1024)
+
+            await safe_api_call(
+                progress_msg.edit_text,
+                f"{file_name}\nUploading: {percent}%\nSpeed: {speed_mb:.2f} MB/s"
+            )
+
+    width, height, duration = get_video_metadata(file_path)
+    thumb = os.path.join(DOWNLOAD_DIR, "thumb.jpg")
+    random_thumbnail(file_path, thumb)
+
+    await safe_api_call(
+        app.send_video,
+        message.chat.id,
+        file_path,
+        thumb=thumb if os.path.exists(thumb) else None,
+        caption=file_name,
+        supports_streaming=True,
+        duration=duration,
+        width=width,
+        height=height,
+        progress=progress
+    )
+
+    log("UPLOAD", f"Completed: {file_name}")
+
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        log("CLEANUP", f"Removed file: {file_name}")
+    if os.path.exists(thumb):
+        os.remove(thumb)
 
     try:
-        ext = file_name.lower().split(".")[-1]
-        video_ext = ["mp4", "mkv", "mov", "webm"]
-        image_ext = ["jpg", "jpeg", "png", "webp"]
-        audio_ext = ["mp3", "m4a", "aac", "ogg", "wav"]
-
-        if ext in video_ext:
-            thumb = os.path.join(DOWNLOAD_DIR, "thumb.jpg")
-            random_thumbnail(file_path, thumb)
-
-            width, height, duration = get_video_metadata(file_path)
-
-            await safe_api_call(
-                app.send_video,
-                message.chat.id,
-                file_path,
-                thumb=thumb,
-                caption=caption,
-                supports_streaming=True,
-                duration=duration,
-                width=width,
-                height=height,
-                progress=upload_progress
-            )
-
-            if os.path.exists(thumb):
-                os.remove(thumb)
-
-        elif ext in image_ext:
-            await safe_api_call(
-                app.send_photo,
-                message.chat.id,
-                file_path,
-                caption=caption
-            )
-
-        elif ext in audio_ext:
-            await safe_api_call(
-                app.send_audio,
-                message.chat.id,
-                file_path,
-                caption=caption,
-                file_name=file_name
-            )
-
-        else:
-            width, height, duration = get_video_metadata(file_path)
-
-            await safe_api_call(
-                app.send_video,
-                message.chat.id,
-                file_path,
-                caption=caption,
-                supports_streaming=True,
-                duration=duration,
-                width=width,
-                height=height,
-                progress=upload_progress
-            )
-
-        log("UPLOAD", f"Completed: {file_name}")
-
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            log("CLEANUP", f"Removed file: {file_name}")
-
-    await safe_api_call(progress_msg.edit_text, "Task Done")
-
+        await progress_msg.delete()
+    except:
+        pass
 
 # ========= COMMANDS =========
 @app.on_message(filters.command("download") & filters.reply)
-async def download_handler(client: Client, message: Message):
-    global queue
-
+async def download_handler(client, message):
     if message.from_user.id != OWNER_ID:
         return await message.reply_text("❌ Unauthorized.")
-
     if len(queue) >= MAX_QUEUE:
         return await message.reply_text("Queue full (max 5 items).")
 
-    media_msg = message.reply_to_message
-    media = media_msg.document or media_msg.video or media_msg.audio or media_msg.photo
-    file_name = getattr(media, "file_name", "photo")
+    replied = message.reply_to_message
+    media = replied.document or replied.video or replied.audio or replied.photo
 
-    queue.append(message)
-    log("QUEUE", f"Added: {file_name} (position {len(queue)})")
+    file_name = getattr(media, "file_name", None)
 
-    await message.reply_text(f"Added to queue. Position: {len(queue)}")
+    if not file_name:
+       if replied.photo:
+          file_name = f"photo_{int(time.time())}.jpg"
+       elif replied.video:
+          file_name = f"video_{int(time.time())}.mp4"
+       elif replied.audio:
+          file_name = f"audio_{int(time.time())}.mp3"
+       else:
+          file_name = f"file_{int(time.time())}"
+
+    queue_msg = await message.reply_text(f"Added to queue. Position: {len(queue)+1}")
+    log("QUEUE", f"Added: {file_name} | Position: {len(queue)+1}")
+
+    queue.append(("telegram", message, queue_msg, file_name))
     await process_queue()
 
+@app.on_message(filters.command("url"))
+async def url_handler(client, message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ Unauthorized.")
+    if len(queue) >= MAX_QUEUE:
+        return await message.reply_text("Queue full (max 5 items).")
+
+    url = message.text.split(" ",1)[1].strip()
+    file_name = url.split("/")[-1].split("?")[0] or "file"
+
+    queue_msg = await message.reply_text(f"Added to queue. Position: {len(queue)+1}")
+    log("QUEUE", f"Added: {file_name} | Position: {len(queue)+1}")
+
+    queue.append(("url", message, queue_msg, file_name))
+    await process_queue()
 
 @app.on_message(filters.command("queue"))
 async def show_queue(client: Client, message: Message):
@@ -296,22 +324,16 @@ async def show_queue(client: Client, message: Message):
 
     await message.reply_text(text)
 
-
 @app.on_message(filters.command("cancel"))
-async def cancel_handler(client: Client, message: Message):
+async def cancel_handler(client, message):
     global current_task, queue
-
     if message.from_user.id != OWNER_ID:
         return
-
     if current_task and not current_task.done():
         current_task.cancel()
-
+        log("CANCEL", "Active task cancelled")
     queue.clear()
-    log("CANCEL", "Cancelled current task and cleared queue")
-
-    await message.reply_text("Current task cancelled & queue cleared.")
-
+    log("CANCEL", "Queue cleared")
 
 log("INFO", "Bot started and ready")
 app.run()
